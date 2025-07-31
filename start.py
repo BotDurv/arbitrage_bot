@@ -1,43 +1,39 @@
+import os
 import requests
+import time
 import pandas as pd
 
-API_KEY = "c347451c4dcd5b8b0266f0cd462070b9"  # Get from https://theoddsapi.com/
-SPORT = "aussierules_afl"       # Change to soccer_epl, tennis_atp, etc.
-REGION = "au"                  # 'au' (Australia), 'uk', 'eu', 'us'
-MARKETS = "h2h,totals"         # h2h = moneyline, totals = over/under
+# Load from Render environment variables
+API_KEY = os.getenv("c347451c4dcd5b8b0266f0cd462070b9")
+DISCORD_WEBHOOK = os.getenv("https://discord.com/api/webhooks/1400306346456518796/IHHcwaeKzeHl9ZQyttQ2oyMCoRgHajLAvm-UG8mX3Fl_8ZDhOxso4fmk31_KzaSodyGR")
 
+SPORT = "aussierules_afl"  
+REGION = "au"
+MARKETS = "h2h,totals"
 
+# -------------------- Fetch Odds --------------------
 def fetch_odds():
     url = f"https://api.the-odds-api.com/v4/sports/{SPORT}/odds/"
     params = {"apiKey": API_KEY, "regions": REGION, "markets": MARKETS}
     response = requests.get(url, params=params)
-
     try:
         data = response.json()
     except Exception as e:
-        print(f"❌ Error decoding JSON: {e}")
+        print(f"Error decoding JSON: {e}")
         return []
-
     if isinstance(data, dict) and "message" in data:
-        print(f"❌ API Error: {data['message']}")
+        print(f"API Error: {data['message']}")
         return []
-
     return data
 
+# -------------------- Discord Alert --------------------
+def send_discord_alert(message):
+    if DISCORD_WEBHOOK:
+        requests.post(DISCORD_WEBHOOK, json={"content": message})
 
-def list_sports():
-    url = f"https://api.the-odds-api.com/v4/sports/"
-    params = {"apiKey": API_KEY}
-    response = requests.get(url, params=params)
-    print(response.json())
-
-list_sports()
-
-
+# -------------------- Arbitrage Calculation --------------------
 def calc_arbitrage(odds):
-    inv_sum = sum([1/o for o in odds])
-    return inv_sum  # <1 means profit
-
+    return sum([1/o for o in odds])  # <1 means profit
 
 def calc_stakes(total_stake, odds):
     arb_percent = calc_arbitrage(odds)
@@ -45,46 +41,36 @@ def calc_stakes(total_stake, odds):
     profit = (total_stake / arb_percent) - total_stake
     return stakes, profit
 
-
 def detect_surebets(data):
     surebets = []
     for event in data:
-        # ✅ Skip invalid events
         if "bookmakers" not in event or not isinstance(event["bookmakers"], list) or len(event["bookmakers"]) == 0:
             continue
-
         odds_map = {}
         for book in event['bookmakers']:
             if "markets" not in book or len(book['markets']) == 0:
                 continue
-
             for outcome in book['markets'][0].get('outcomes', []):
                 odds_map.setdefault(outcome['name'], []).append((book['title'], outcome['price']))
-
-        # ✅ Check if at least 2 outcomes exist
         market_outcomes = list(odds_map.keys())
         if len(market_outcomes) >= 2:
             best_odds = [max(odds_map[o], key=lambda x: x[1]) for o in market_outcomes]
             arb_percent = calc_arbitrage([odd for _, odd in best_odds])
-
             if arb_percent < 1:
                 stakes, profit = calc_stakes(100, [odd for _, odd in best_odds])
                 surebets.append({
-                    "event": event.get('home_team', 'Unknown') + " vs " + event.get('away_team', 'Unknown'),
+                    "event": f"{event.get('home_team', 'Unknown')} vs {event.get('away_team', 'Unknown')}",
                     "market": f"{len(market_outcomes)}-way",
                     "best_odds": best_odds,
                     "arb%": arb_percent,
                     "stakes": (stakes, profit)
                 })
-
     return surebets
 
-
+# -------------------- Middles --------------------
 def calc_middle_stakes(over_odds, under_odds, base_stake=100):
-    # Stake to equalize potential payouts
     under_stake = (base_stake * over_odds) / under_odds
     return round(base_stake, 2), round(under_stake, 2)
-
 
 def detect_middles(data):
     middles = []
@@ -104,7 +90,7 @@ def detect_middles(data):
                         under_odds = spreads[j][1][1][1]
                         over_stake, under_stake = calc_middle_stakes(over_odds, under_odds)
                         middles.append({
-                            "event": event['home_team'] + " vs " + event['away_team'],
+                            "event": f"{event['home_team']} vs {event['away_team']}",
                             "gap": gap,
                             "over_book": spreads[i][0],
                             "under_book": spreads[j][0],
@@ -114,29 +100,32 @@ def detect_middles(data):
                         })
     return middles
 
+# -------------------- AFK Loop --------------------
+def run_afk_loop(interval=300):
+    while True:
+        print("🔄 Fetching live odds...")
+        data = fetch_odds()
 
-def main():
-    print("Fetching live odds...")
-    data = fetch_odds()
+        # Surebets
+        surebets = detect_surebets(data)
+        for sb in surebets:
+            msg = (f"💸 Surebet: {sb['event']} | Arb%: {round(sb['arb%']*100,2)}%\n"
+                   f"Profit: ${round(sb['stakes'][1],2)} guaranteed")
+            print(msg)
+            send_discord_alert(msg)
 
-    print("\n📊 Raw API Response:")
-    print(data)
-    
-    print("\n🔎 Surebets Found:")
-    surebets = detect_surebets(data)
-    for sb in surebets:
-        print(f"\n{sb['event']} | {sb['market']} | Arb%: {round(sb['arb%']*100,2)}%")
-        for (book, odd), stake in zip(sb['best_odds'], sb['stakes'][0]):
-            print(f"- Bet {round(stake,2)} on {book} @ {odd}")
-        print(f"💰 Profit: ${round(sb['stakes'][1],2)} guaranteed")
+        # Middles
+        middles = detect_middles(data)
+        for mid in middles:
+            msg = (f"🔥 Middle Found: {mid['event']} | Gap: {mid['gap']} pts\n"
+                   f"{mid['over_book']}: {mid['over']}\n"
+                   f"{mid['under_book']}: {mid['under']}\n"
+                   f"Stakes: Over ${mid['stakes'][0]} | Under ${mid['stakes'][1]}")
+            print(msg)
+            send_discord_alert(msg)
 
-    print("\n🔎 Middles Found:")
-    middles = detect_middles(data)
-    for mid in middles:
-        print(f"{mid['over_book']}: {mid['over']}")
-    print(f"{mid['under_book']}: {mid['under']}")
-    print(f"Recommended Stakes: Over ${mid['stakes'][0]} | Under ${mid['stakes'][1]}")
-
+        print(f"Waiting {interval/60} min...\n")
+        time.sleep(interval)
 
 if __name__ == "__main__":
-    main()
+    run_afk_loop(interval=300)  # 5 min loop
